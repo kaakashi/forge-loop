@@ -1,0 +1,41 @@
+# dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# production
+dist/
+build/
+generated-runs
+
+# generated clients
+src/generated/prisma/
+
+# local env
+.env
+.env*.local
+!.env.example
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# test artifacts
+coverage/
+tsconfig.tsbuildinfo
+playwright-report/
+test-results/
+
+# OS and local data
+.DS_Store
+*.sqlite
+*.db
+.flowlens/
+
+# bundled starter archive
+flowlens_codex_starter.zip
