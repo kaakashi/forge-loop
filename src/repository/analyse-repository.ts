@@ -31,6 +31,7 @@ export interface RepositoryContext {
   root: string;
   trackedFiles: string[];
   importantFiles: Record<string, string>;
+  packageScripts: Record<string, string>;
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -97,16 +98,65 @@ async function readImportantFiles(
   return contents;
 }
 
+async function readPackageScripts(
+  root: string,
+): Promise<Record<string, string>> {
+  const packageJsonPath = path.join(root, "package.json");
+
+  if (!(await fileExists(packageJsonPath))) {
+    return {};
+  }
+
+  try {
+    const rawContent = await readFile(packageJsonPath, "utf8");
+
+    const parsed: unknown = JSON.parse(rawContent);
+
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("scripts" in parsed)
+    ) {
+      return {};
+    }
+
+    const scripts = (
+      parsed as {
+        scripts?: unknown;
+      }
+    ).scripts;
+
+    if (typeof scripts !== "object" || scripts === null) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(scripts).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+  } catch (error) {
+    throw new Error(`Could not parse package.json at ${packageJsonPath}.`, {
+      cause: error,
+    });
+  }
+}
+
 export async function analyseRepository(
   repositoryPath: string,
 ): Promise<RepositoryContext> {
   const root = await resolveGitRoot(repositoryPath);
-  const trackedFiles = await getTrackedFiles(root);
-  const importantFiles = await readImportantFiles(root);
+
+  const [trackedFiles, importantFiles, packageScripts] = await Promise.all([
+    getTrackedFiles(root),
+    readImportantFiles(root),
+    readPackageScripts(root),
+  ]);
 
   return {
     root,
     trackedFiles,
     importantFiles,
+    packageScripts,
   };
 }

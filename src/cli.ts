@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { createEngineeringPlan } from "./providers/ollama-planner.js";
 import { analyseRepository } from "./repository/analyse-repository.js";
 import { savePlanningRun } from "./runs/save-run.js";
+import { verifyEngineeringPlan } from "./domain/verify-plan.js";
 
 const program = new Command();
 
@@ -33,11 +34,65 @@ program
 
       console.log(`Requesting plan from ${options.model}...`);
 
-      const plan = await createEngineeringPlan({
-        task: options.task,
-        repository,
-        model: options.model,
-      });
+      const MAX_PLAN_ATTEMPTS = 3;
+
+      let plan: Awaited<ReturnType<typeof createEngineeringPlan>> | undefined;
+
+      let verification: ReturnType<typeof verifyEngineeringPlan> | undefined;
+
+      let verificationFeedback: string[] = [];
+
+      for (let attempt = 1; attempt <= MAX_PLAN_ATTEMPTS; attempt += 1) {
+        console.log(
+          `Requesting plan from ${options.model} ` +
+            `(attempt ${attempt}/${MAX_PLAN_ATTEMPTS})...`,
+        );
+
+        plan = await createEngineeringPlan({
+          task: options.task,
+          repository,
+          model: options.model,
+          verificationFeedback,
+        });
+
+        verification = verifyEngineeringPlan(plan, repository);
+
+        if (verification.valid) {
+          break;
+        }
+
+        console.log("\nPlan verification failed:\n");
+
+        for (const issue of verification.issues) {
+          const prefix = issue.severity === "error" ? "ERROR" : "WARNING";
+
+          console.log(`[${prefix}] ${issue.code}: ${issue.message}`);
+        }
+
+        verificationFeedback = verification.issues
+          .filter((issue) => issue.severity === "error")
+          .map((issue) => `${issue.code}: ${issue.message}`);
+
+        if (attempt < MAX_PLAN_ATTEMPTS) {
+          console.log("\nSending verification feedback to the planner...\n");
+        }
+      }
+
+      if (!plan || !verification) {
+        throw new Error("The planner did not produce a plan.");
+      }
+
+      if (!verification.valid) {
+        console.error(`\nPlan rejected after ${MAX_PLAN_ATTEMPTS} attempts.`);
+
+        process.exitCode = 2;
+        return;
+      }
+
+      console.log("\nPlan verification passed.");
+
+      console.log("\nPlan created successfully:\n");
+      console.log(JSON.stringify(plan, null, 2));
 
       const outputPath = await savePlanningRun({
         task: options.task,
@@ -45,9 +100,6 @@ program
         repository,
         plan,
       });
-
-      console.log("\nPlan created successfully:\n");
-      console.log(JSON.stringify(plan, null, 2));
       console.log(`\nRun record saved to: ${outputPath}`);
     } catch (error) {
       console.error("\nForgeLoop planning failed.");

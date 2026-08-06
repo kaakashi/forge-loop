@@ -1,10 +1,21 @@
 import * as z from "zod";
 
+export const FileChangeSchema = z.object({
+  path: z.string().min(1),
+
+  action: z.enum(["create", "modify", "delete"]),
+
+  reason: z.string().min(1),
+});
+
 export const PlanStepSchema = z.object({
   order: z.number().int().positive(),
+
   description: z.string().min(1),
-  expectedFiles: z.array(z.string()),
-  validation: z.array(z.string()),
+
+  fileChanges: z.array(FileChangeSchema).min(1),
+
+  validation: z.array(z.string().min(1)).min(1),
 });
 
 export const EngineeringPlanSchema = z.object({
@@ -12,7 +23,11 @@ export const EngineeringPlanSchema = z.object({
 
   assumptions: z.array(z.string()),
 
-  relevantFiles: z.array(z.string()),
+  acceptanceCriteria: z.array(z.string().min(1)).min(1),
+
+  outOfScope: z.array(z.string()),
+
+  relevantExistingFiles: z.array(z.string()),
 
   steps: z.array(PlanStepSchema).min(1),
 
@@ -26,3 +41,5 @@ export const EngineeringPlanSchema = z.object({
 });
 
 export type EngineeringPlan = z.infer<typeof EngineeringPlanSchema>;
+
+export type FileChange = z.infer<typeof FileChangeSchema>;
