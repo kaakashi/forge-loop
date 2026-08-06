@@ -9,6 +9,7 @@ out/
 dist/
 build/
 generated-runs
+generated-worktrees/
 
 # generated clients
 src/generated/prisma/
@@ -39,3 +40,4 @@ test-results/
 
 # bundled starter archive
 flowlens_codex_starter.zip
+generated-worktrees/

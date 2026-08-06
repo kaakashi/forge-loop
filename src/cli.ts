@@ -4,6 +4,7 @@ import { createEngineeringPlan } from "./providers/ollama-planner.js";
 import { analyseRepository } from "./repository/analyse-repository.js";
 import { savePlanningRun } from "./runs/save-run.js";
 import { verifyEngineeringPlan } from "./domain/verify-plan.js";
+import { createIsolatedWorktree } from "./git/create-worktree.js";
 
 const program = new Command();
 
@@ -122,6 +123,42 @@ program
         if (error.cause instanceof Error) {
           console.error(`Cause: ${error.cause.message}`);
         }
+      } else {
+        console.error(error);
+      }
+
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("workspace")
+  .description("Create an isolated Git worktree for an engineering task.")
+  .requiredOption("--repo <path>", "Path to the target Git repository.")
+  .requiredOption("--task <description>", "Engineering task for the workspace.")
+  .action(async (options: { repo: string; task: string }) => {
+    try {
+      console.log("Inspecting repository state...");
+
+      const repository = await analyseRepository(options.repo);
+
+      console.log("Creating isolated worktree...");
+
+      const workspace = await createIsolatedWorktree({
+        repositoryRoot: repository.root,
+        task: options.task,
+      });
+
+      console.log("\nWorkspace created successfully:\n");
+
+      console.log(JSON.stringify(workspace, null, 2));
+
+      console.log(`\nOpen workspace:\ncd "${workspace.worktreePath}"`);
+    } catch (error) {
+      console.error("\nWorkspace creation failed.");
+
+      if (error instanceof Error) {
+        console.error(error.message);
       } else {
         console.error(error);
       }
