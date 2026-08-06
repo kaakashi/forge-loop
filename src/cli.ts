@@ -32,8 +32,6 @@ program
 
       console.log(`Found ${repository.trackedFiles.length} tracked files.`);
 
-      console.log(`Requesting plan from ${options.model}...`);
-
       const MAX_PLAN_ATTEMPTS = 3;
 
       let plan: Awaited<ReturnType<typeof createEngineeringPlan>> | undefined;
@@ -55,7 +53,7 @@ program
           verificationFeedback,
         });
 
-        verification = verifyEngineeringPlan(plan, repository);
+        verification = verifyEngineeringPlan(plan, repository, options.task);
 
         if (verification.valid) {
           break;
@@ -89,7 +87,21 @@ program
         return;
       }
 
-      console.log("\nPlan verification passed.");
+      const warnings = verification.issues.filter(
+        (issue) => issue.severity === "warning",
+      );
+
+      if (warnings.length > 0) {
+        console.log(
+          `\nPlan verification passed with ${warnings.length} warning(s):\n`,
+        );
+
+        for (const warning of warnings) {
+          console.log(`[WARNING] ${warning.code}: ${warning.message}`);
+        }
+      } else {
+        console.log("\nPlan verification passed.");
+      }
 
       console.log("\nPlan created successfully:\n");
       console.log(JSON.stringify(plan, null, 2));

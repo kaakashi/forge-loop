@@ -90,15 +90,115 @@ function extractPackageScript(command: string): string | null {
   return null;
 }
 
+function normalizeEvidence(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function containsEvidence(source: string, evidence: string): boolean {
+  const normalizedSource = normalizeEvidence(source);
+
+  const normalizedEvidence = normalizeEvidence(evidence);
+
+  return (
+    normalizedEvidence.length >= 3 &&
+    normalizedSource.includes(normalizedEvidence)
+  );
+}
+
+const PRODUCT_DECISION_PATTERN =
+  /\b(default|environment variable|env var|status code|error code|maximum|minimum|limit|timeout|retry|database field|api response|ui behavior|ui behaviour)\b/i;
+
 export function verifyEngineeringPlan(
   plan: EngineeringPlan,
   repository: RepositoryContext,
+  task: string,
 ): PlanVerification {
   const issues: PlanIssue[] = [];
 
   const trackedFiles = new Set(
     repository.trackedFiles.map((file) => file.replaceAll("\\", "/")),
   );
+
+  for (const assumption of plan.assumptions) {
+    const looksLikeProductDecision =
+      assumption.impact === "product_behavior" ||
+      PRODUCT_DECISION_PATTERN.test(assumption.statement);
+
+    if (assumption.source === "task") {
+      if (
+        !assumption.evidence ||
+        !containsEvidence(task, assumption.evidence)
+      ) {
+        issues.push({
+          severity: "error",
+          code: "TASK_EVIDENCE_NOT_FOUND",
+          message: `Assumption claims task evidence that was not found: ${assumption.statement}`,
+        });
+      }
+    }
+
+    if (assumption.source === "repository") {
+      if (!assumption.evidence || !assumption.evidencePath) {
+        issues.push({
+          severity: "error",
+          code: "MISSING_REPOSITORY_EVIDENCE",
+          message: `Repository-backed assumption lacks evidence: ${assumption.statement}`,
+        });
+
+        continue;
+      }
+
+      const normalizedPath = normalizeRepositoryPath(assumption.evidencePath);
+
+      if (!normalizedPath) {
+        issues.push({
+          severity: "error",
+          code: "UNSAFE_EVIDENCE_PATH",
+          message: `Invalid evidence path: ${assumption.evidencePath}`,
+        });
+
+        continue;
+      }
+
+      const inspectedContent = repository.importantFiles[normalizedPath];
+
+      if (!inspectedContent) {
+        issues.push({
+          severity: "error",
+          code: "EVIDENCE_FILE_NOT_INSPECTED",
+          message: `The planner cited an uninspected file: ${normalizedPath}`,
+          path: normalizedPath,
+        });
+
+        continue;
+      }
+
+      if (!containsEvidence(inspectedContent, assumption.evidence)) {
+        issues.push({
+          severity: "error",
+          code: "REPOSITORY_EVIDENCE_NOT_FOUND",
+          message: `The cited evidence was not found in ${normalizedPath}.`,
+          path: normalizedPath,
+        });
+      }
+    }
+
+    if (assumption.source === "planner" && looksLikeProductDecision) {
+      issues.push({
+        severity: "error",
+        code: "UNSUPPORTED_PRODUCT_DECISION",
+        message: `The planner invented a product decision: ${assumption.statement}`,
+      });
+    }
+
+    if (assumption.source === "unresolved" && !plan.requiresClarification) {
+      issues.push({
+        severity: "error",
+        code: "UNRESOLVED_DECISION_WITHOUT_CLARIFICATION",
+        message: `The plan contains an unresolved decision but does not request clarification: ${assumption.statement}`,
+      });
+    }
+  }
 
   const stepOrders = new Set<number>();
 
@@ -204,7 +304,23 @@ export function verifyEngineeringPlan(
     }
   }
 
-  for (const command of plan.finalValidationCommands) {
+  const allValidationCommands = [
+    ...plan.finalValidationCommands,
+    ...plan.steps.flatMap((step) => step.validationCommands),
+  ];
+
+  for (const command of allValidationCommands) {
+    if (/\s+on\s+[\w./-]+\s*$/i.test(command)) {
+      issues.push({
+        severity: "error",
+        code: "DESCRIPTIVE_TEXT_IN_COMMAND",
+        message: `Validation command contains descriptive text: ${command}`,
+        command,
+      });
+
+      continue;
+    }
+
     const scriptName = extractPackageScript(command);
 
     if (!scriptName) {
@@ -222,7 +338,7 @@ export function verifyEngineeringPlan(
       issues.push({
         severity: "error",
         code: "PACKAGE_SCRIPT_NOT_FOUND",
-        message: `The plan references package script "${scriptName}", but it does not exist in package.json.`,
+        message: `Package script "${scriptName}" does not exist.`,
         command,
       });
     }
@@ -245,8 +361,33 @@ export function verifyEngineeringPlan(
     });
   }
 
+  const BLOCKING_ISSUE_CODES = new Set([
+    "DUPLICATE_STEP_ORDER",
+
+    "UNSAFE_FILE_PATH",
+    "ANNOTATED_FILE_PATH",
+
+    "MODIFY_FILE_NOT_FOUND",
+    "DELETE_FILE_NOT_FOUND",
+    "CREATE_FILE_ALREADY_EXISTS",
+
+    "UNSAFE_RELEVANT_FILE_PATH",
+    "ANNOTATED_RELEVANT_FILE_PATH",
+    "RELEVANT_FILE_NOT_FOUND",
+
+    "PACKAGE_SCRIPT_NOT_FOUND",
+    "DESCRIPTIVE_TEXT_IN_COMMAND",
+
+    "MISSING_CLARIFICATION_QUESTIONS",
+  ]);
+
+  const normalizedIssues: PlanIssue[] = issues.map((issue) => ({
+    ...issue,
+    severity: BLOCKING_ISSUE_CODES.has(issue.code) ? "error" : "warning",
+  }));
+
   return {
-    valid: !issues.some((issue) => issue.severity === "error"),
-    issues,
+    valid: !normalizedIssues.some((issue) => issue.severity === "error"),
+    issues: normalizedIssues,
   };
 }

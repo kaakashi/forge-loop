@@ -1,5 +1,17 @@
 import * as z from "zod";
 
+export const AssumptionSchema = z.object({
+  statement: z.string().min(1),
+
+  impact: z.enum(["implementation_detail", "product_behavior"]),
+
+  source: z.enum(["task", "repository", "planner", "unresolved"]),
+
+  evidence: z.string().optional(),
+
+  evidencePath: z.string().optional(),
+});
+
 export const FileChangeSchema = z.object({
   path: z.string().min(1),
 
@@ -15,13 +27,15 @@ export const PlanStepSchema = z.object({
 
   fileChanges: z.array(FileChangeSchema).min(1),
 
-  validation: z.array(z.string().min(1)).min(1),
+  validationCommands: z.array(z.string()),
+
+  manualChecks: z.array(z.string()),
 });
 
 export const EngineeringPlanSchema = z.object({
   summary: z.string().min(1),
 
-  assumptions: z.array(z.string()),
+  assumptions: z.array(AssumptionSchema),
 
   acceptanceCriteria: z.array(z.string().min(1)).min(1),
 
@@ -41,5 +55,3 @@ export const EngineeringPlanSchema = z.object({
 });
 
 export type EngineeringPlan = z.infer<typeof EngineeringPlanSchema>;
-
-export type FileChange = z.infer<typeof FileChangeSchema>;

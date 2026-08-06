@@ -99,6 +99,32 @@ Rules:
 19. Example of an invalid path:
     - package.json (scripts: test, test:integration)
 20. If no file needs to change for a proposed step, omit that step.
+21. Every assumption must identify its source.
+
+22. Use source="task" only when the assumption is explicitly stated in the
+    engineering task. Include the exact supporting phrase in evidence.
+
+23. Use source="repository" only when the assumption is directly supported by
+    provided repository content. Include evidencePath and an exact supporting
+    excerpt in evidence.
+
+24. Use source="planner" only for internal implementation details that do not
+    alter externally observable product behaviour.
+
+25. Defaults, environment-variable names, limits, status codes, error codes,
+    API response structures, UI behaviour, database fields and retry policies
+    are product behaviour.
+
+26. Never assign source="planner" to a product-behaviour decision.
+
+27. When a product-behaviour decision is unspecified, use source="unresolved",
+    set requiresClarification=true and ask a focused clarification question.
+
+28. validationCommands must contain executable commands only. Put descriptive
+    verification instructions in manualChecks.
+
+29. Do not append phrases such as "on file.ts" to shell commands unless that
+    syntax is genuinely supported by the command.
 `.trim(),
       },
       {
