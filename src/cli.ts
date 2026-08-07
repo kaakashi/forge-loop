@@ -1,18 +1,22 @@
 import { Command } from "commander";
 
+import path from "node:path";
+import { readFile } from "node:fs/promises";
+
 import { createEngineeringPlan } from "./providers/ollama-planner.js";
 import { analyseRepository } from "./repository/analyse-repository.js";
-import { savePlanningRun } from "./runs/save-run.js";
 import { verifyEngineeringPlan } from "./domain/verify-plan.js";
+import { savePlanningRun } from "./runs/save-run.js";
+
 import { createIsolatedWorktree } from "./git/create-worktree.js";
-import { readFile } from "node:fs/promises";
-import path from "node:path";
 
 import { assertSafeAgentWorkspace } from "./agent/workspace-safety.js";
 
 import { runImplementationAgent } from "./agent/run-implementation-agent.js";
-
 import { saveImplementationRun } from "./runs/save-implementation-run.js";
+
+import { runValidation } from "./validation/run-validation.js";
+import { saveValidationRun } from "./runs/save-validation-run.js";
 
 const program = new Command();
 
@@ -299,5 +303,76 @@ program
       }
     },
   );
+
+program
+  .command("validate")
+  .description(
+    "Run deterministic validation against an agent-generated workspace.",
+  )
+  .requiredOption("--workspace <path>", "ForgeLoop worktree to validate.")
+  .option("--task <description>", "Original engineering task.")
+  .action(async (options: { workspace: string; task?: string }) => {
+    try {
+      console.log("Starting deterministic validation...\n");
+
+      const result = await runValidation(options.workspace);
+
+      const reportPath = await saveValidationRun({
+        workspace: options.workspace,
+
+        task: options.task,
+
+        result,
+      });
+
+      console.log("\nValidation result:\n");
+
+      for (const check of result.checks) {
+        console.log(
+          `${check.passed ? "PASS" : "FAIL"} ${check.script} (${check.durationMs}ms)`,
+        );
+
+        if (!check.passed) {
+          if (check.stdout) {
+            console.log("\nSTDOUT:\n");
+
+            console.log(check.stdout);
+          }
+
+          if (check.stderr) {
+            console.log("\nSTDERR:\n");
+
+            console.log(check.stderr);
+          }
+        }
+      }
+
+      console.log("\nSummary:\n");
+
+      console.log(
+        JSON.stringify(
+          {
+            passed: result.passed,
+
+            failedChecks: result.failedChecks,
+
+            reportPath,
+          },
+          null,
+          2,
+        ),
+      );
+
+      if (!result.passed) {
+        process.exitCode = 2;
+      }
+    } catch (error) {
+      console.error("\nValidation failed to run.");
+
+      console.error(error instanceof Error ? error.message : error);
+
+      process.exitCode = 1;
+    }
+  });
 
 await program.parseAsync(process.argv);
