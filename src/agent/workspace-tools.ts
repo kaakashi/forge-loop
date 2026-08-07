@@ -31,6 +31,16 @@ const BLOCKED_PATH_SEGMENTS = new Set([
   "coverage",
 ]);
 
+const BLOCKED_FILE_NAMES = new Set([
+  ".env",
+  ".env.local",
+  ".env.test",
+  ".env.production",
+  ".env.development",
+  ".env.development.local",
+  ".env.production.local",
+]);
+
 const ALLOWED_SCRIPT_PATTERN =
   /^(test(?::[\w-]+)?|lint(?::[\w-]+)?|typecheck|check(?::[\w-]+)?|format:check|build)$/;
 
@@ -112,9 +122,36 @@ async function pathExists(targetPath: string): Promise<boolean> {
 }
 
 function containsBlockedSegment(relativePath: string): boolean {
-  return relativePath
-    .split(/[\\/]/)
-    .some((segment) => BLOCKED_PATH_SEGMENTS.has(segment));
+  const normalizedPath = relativePath.replaceAll("\\", "/");
+
+  const segments = normalizedPath.split("/").filter(Boolean);
+
+  if (segments.some((segment) => BLOCKED_PATH_SEGMENTS.has(segment))) {
+    return true;
+  }
+
+  const filename = segments.at(-1);
+
+  if (!filename) {
+    return false;
+  }
+
+  if (BLOCKED_FILE_NAMES.has(filename)) {
+    return true;
+  }
+
+  /*
+   * Also catch variants such as:
+   *
+   * .env.staging
+   * .env.test.local
+   * .env.whatever
+   */
+  if (filename.startsWith(".env.")) {
+    return true;
+  }
+
+  return false;
 }
 
 function resolveInsideWorkspace(

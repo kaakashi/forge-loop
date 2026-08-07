@@ -83,6 +83,23 @@ Rules:
 
 18. Never output FORGELOOP_TASK_COMPLETE while you still intend to make
     another modification, investigate an error, or run additional validation.
+19. Preserve existing public function signatures and contracts unless the
+    engineering task explicitly requires changing them.
+
+20. Before adding or modifying an integration test, inspect at least one
+    nearby existing integration test and reuse the repository's established
+    fixtures, seeded workspace data, authentication context, and database
+    setup patterns.
+
+21. Do not invent database IDs, workspace IDs, user IDs, or other persisted
+    entities when the code under test writes database records. Use existing
+    test setup patterns instead.
+
+22. Prefer extending an existing implementation at the narrowest relevant
+    layer rather than redesigning surrounding APIs.
+
+23. Do not modify unrelated tests merely to accommodate an unnecessary API
+    signature change.
 `.trim(),
     },
     {

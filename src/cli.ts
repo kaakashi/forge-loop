@@ -21,6 +21,8 @@ import { saveValidationRun } from "./runs/save-validation-run.js";
 import { runRepairAgent } from "./agent/run-repair-agent.js";
 import { saveRepairRun } from "./runs/save-repair-run.js";
 
+import { bootstrapWorkspace } from "./workspace/bootstrap-workspace.js";
+
 const program = new Command();
 
 program
@@ -570,5 +572,42 @@ program
       }
     },
   );
+
+program
+  .command("bootstrap")
+  .description(
+    "Prepare an isolated ForgeLoop worktree for deterministic execution.",
+  )
+  .requiredOption("--repo <path>", "Source repository.")
+  .requiredOption("--workspace <path>", "Generated ForgeLoop worktree.")
+  .action(async (options: { repo: string; workspace: string }) => {
+    try {
+      console.log("Bootstrapping workspace...\n");
+
+      const result = await bootstrapWorkspace({
+        sourceRepository: options.repo,
+
+        workspace: options.workspace,
+      });
+
+      console.log(`Workspace: ${result.workspaceRoot}\n`);
+
+      for (const step of result.steps) {
+        const marker = step.status === "completed" ? "DONE" : "SKIP";
+
+        console.log(`[${marker}] ${step.name}`);
+
+        console.log(`       ${step.detail}\n`);
+      }
+
+      console.log("Workspace bootstrap complete.");
+    } catch (error) {
+      console.error("\nWorkspace bootstrap failed.");
+
+      console.error(error instanceof Error ? error.message : error);
+
+      process.exitCode = 1;
+    }
+  });
 
 await program.parseAsync(process.argv);
