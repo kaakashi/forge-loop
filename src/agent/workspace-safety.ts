@@ -163,6 +163,7 @@ export async function assertSafeAgentWorkspace(input: {
   sourceRepository: string;
   workspace: string;
   expectedSourceName?: string;
+  allowDirty?: boolean;
 }): Promise<SafeWorkspace> {
   const sourceRepositoryRoot = await resolveGitRoot(input.sourceRepository);
 
@@ -254,10 +255,12 @@ export async function assertSafeAgentWorkspace(input: {
    * node_modules symlink pointing back to the
    * flow-lens-ai-demo dependency directory.
    */
-  await assertWorkspaceCleanExceptRuntimeArtifacts(
-    sourceRepositoryRoot,
-    workspaceRoot,
-  );
+  if (!input.allowDirty) {
+    await assertWorkspaceCleanExceptRuntimeArtifacts(
+      sourceRepositoryRoot,
+      workspaceRoot,
+    );
+  }
 
   const baseCommit = await git(workspaceRoot, ["rev-parse", "HEAD"]);
 
