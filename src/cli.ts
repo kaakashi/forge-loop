@@ -23,6 +23,11 @@ import { saveRepairRun } from "./runs/save-repair-run.js";
 
 import { bootstrapWorkspace } from "./workspace/bootstrap-workspace.js";
 
+import { runReviewAgent } from "./agent/run-review-agent.js";
+import { saveReviewRun } from "./runs/save-review-run.js";
+
+import { registerFinalCommands } from "./commands/register-final-commands.js";
+
 const program = new Command();
 
 program
@@ -320,7 +325,7 @@ program
     try {
       console.log("Starting deterministic validation...\n");
 
-      const result = await runValidation(options.workspace);
+      const result = await runValidation(options.workspace, options.task!);
 
       const reportPath = await saveValidationRun({
         workspace: options.workspace,
@@ -515,7 +520,9 @@ program
 
           model: options.model,
 
-          validationFailures,
+          feedbackSource: "validation",
+
+          feedback: validationFailures,
         });
 
         const reportPath = await saveRepairRun({
@@ -609,5 +616,272 @@ program
       process.exitCode = 1;
     }
   });
+
+program
+  .command("review")
+  .description("Independently review a validated ForgeLoop candidate.")
+  .requiredOption("--workspace <path>", "ForgeLoop candidate worktree.")
+  .requiredOption("--validation-report <path>", "Passing validation report.")
+  .requiredOption("--task <description>", "Original engineering task.")
+  .option(
+    "--model <model>",
+    "Ollama reviewer model.",
+    process.env.OLLAMA_MODEL ?? "qwen3.5:9b",
+  )
+  .action(
+    async (options: {
+      workspace: string;
+      validationReport: string;
+      task: string;
+      model: string;
+    }) => {
+      try {
+        const validationPath = path.resolve(options.validationReport);
+
+        const rawValidation = await readFile(validationPath, "utf8");
+
+        const parsed = JSON.parse(rawValidation) as {
+          result?: {
+            passed?: boolean;
+            checks?: unknown;
+          };
+        };
+
+        if (parsed.result?.passed !== true) {
+          throw new Error(
+            [
+              "Reviewer requires a passing",
+              "deterministic validation report.",
+            ].join(" "),
+          );
+        }
+
+        console.log("Starting independent review...");
+
+        const review = await runReviewAgent({
+          workspaceRoot: options.workspace,
+
+          task: options.task,
+
+          model: options.model,
+
+          validationSummary: JSON.stringify(parsed.result, null, 2),
+        });
+
+        const reportPath = await saveReviewRun({
+          model: options.model,
+
+          task: options.task,
+
+          workspace: options.workspace,
+
+          validationReport: validationPath,
+
+          review,
+        });
+
+        console.log("\nReview result:\n");
+
+        console.log(
+          JSON.stringify(
+            {
+              verdict: review.verdict,
+
+              taskSatisfied: review.taskSatisfied,
+
+              findings: review.findings,
+
+              remainingRisks: review.remainingRisks,
+
+              reportPath,
+            },
+            null,
+            2,
+          ),
+        );
+
+        if (review.verdict === "request_changes") {
+          process.exitCode = 2;
+        }
+      } catch (error) {
+        console.error("\nReview failed.");
+
+        console.error(error instanceof Error ? error.message : error);
+
+        process.exitCode = 1;
+      }
+    },
+  );
+
+program
+  .command("review-repair")
+  .description("Repair a candidate using independent reviewer feedback.")
+  .requiredOption("--repo <path>", "Source repository that owns the worktree.")
+  .requiredOption("--workspace <path>", "ForgeLoop candidate worktree.")
+  .requiredOption(
+    "--review-report <path>",
+    "ForgeLoop review JSON containing requested changes.",
+  )
+  .requiredOption("--task <description>", "Original engineering task.")
+  .option(
+    "--model <model>",
+    "Ollama model.",
+    process.env.OLLAMA_MODEL ?? "qwen3.5:9b",
+  )
+  .option(
+    "--require-source-name <name>",
+    "Expected source repository directory name.",
+  )
+  .action(
+    async (options: {
+      repo: string;
+      workspace: string;
+      reviewReport: string;
+      task: string;
+      model: string;
+      requireSourceName?: string;
+    }) => {
+      try {
+        console.log("Validating review-repair workspace...");
+
+        const safeWorkspace = await assertSafeAgentWorkspace({
+          sourceRepository: options.repo,
+
+          workspace: options.workspace,
+
+          expectedSourceName: options.requireSourceName,
+
+          allowDirty: true,
+        });
+
+        const reviewReportPath = path.resolve(options.reviewReport);
+
+        const raw = await readFile(reviewReportPath, "utf8");
+
+        const parsed = JSON.parse(raw) as {
+          review?: {
+            verdict?: string;
+
+            taskSatisfied?: boolean;
+
+            summary?: string;
+
+            findings?: Array<{
+              severity?: string;
+              category?: string;
+              title?: string;
+              description?: string;
+              evidence?: string;
+              file?: string;
+              suggestedFix?: string;
+            }>;
+
+            remainingRisks?: string[];
+          };
+        };
+
+        if (!parsed.review) {
+          throw new Error("Invalid ForgeLoop review report.");
+        }
+
+        if (parsed.review.verdict !== "request_changes") {
+          throw new Error("Review does not request changes.");
+        }
+
+        const blockingFindings =
+          parsed.review.findings?.filter(
+            (finding) => finding.severity === "blocking",
+          ) ?? [];
+
+        if (blockingFindings.length === 0) {
+          throw new Error(
+            "Review requested changes but contains no blocking findings.",
+          );
+        }
+
+        const reviewFeedback = JSON.stringify(
+          {
+            verdict: parsed.review.verdict,
+
+            taskSatisfied: parsed.review.taskSatisfied,
+
+            summary: parsed.review.summary,
+
+            findings: parsed.review.findings,
+
+            remainingRisks: parsed.review.remainingRisks,
+          },
+          null,
+          2,
+        );
+
+        console.log(
+          `Repairing ${blockingFindings.length} blocking reviewer finding(s)...`,
+        );
+
+        console.log(`Workspace: ${safeWorkspace.workspaceRoot}`);
+
+        console.log(`Branch: ${safeWorkspace.branchName}`);
+
+        console.log(`Model: ${options.model}`);
+
+        const repairResult = await runRepairAgent({
+          workspaceRoot: safeWorkspace.workspaceRoot,
+
+          task: options.task,
+
+          model: options.model,
+
+          feedbackSource: "review",
+
+          feedback: reviewFeedback,
+        });
+
+        console.log("\nReview-feedback repair finished:\n");
+
+        console.log(
+          JSON.stringify(
+            {
+              status: repairResult.status,
+
+              turns: repairResult.turns,
+
+              counters: repairResult.counters,
+
+              usage: repairResult.usage,
+
+              finalMessage: repairResult.finalMessage,
+            },
+            null,
+            2,
+          ),
+        );
+
+        console.log("\nGit status:\n");
+
+        console.log(repairResult.finalStatus);
+
+        console.log("\nGit diff:\n");
+
+        console.log(repairResult.finalDiff);
+
+        /*
+         * Do NOT treat max_turns_reached as proof that
+         * the repair failed.
+         *
+         * The deterministic validator and reviewer
+         * remain the authorities.
+         */
+      } catch (error) {
+        console.error("\nReview-feedback repair failed.");
+
+        console.error(error instanceof Error ? error.message : error);
+
+        process.exitCode = 1;
+      }
+    },
+  );
+
+registerFinalCommands(program);
 
 await program.parseAsync(process.argv);
