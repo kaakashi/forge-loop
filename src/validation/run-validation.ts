@@ -8,6 +8,8 @@ const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 180_000;
 const MAX_OUTPUT_CHARACTERS = 20_000;
 
+type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
+
 export interface ValidationCheck {
   script: string;
   command: string;
@@ -84,7 +86,7 @@ async function loadPackageScripts(
 
 async function detectPackageManager(
   workspaceRoot: string,
-): Promise<"npm" | "pnpm" | "yarn" | "bun"> {
+): Promise<PackageManager> {
   if (await pathExists(path.join(workspaceRoot, "pnpm-lock.yaml"))) {
     return "pnpm";
   }
@@ -103,33 +105,43 @@ async function detectPackageManager(
   return "npm";
 }
 
-function selectValidationScripts(scripts: Record<string, string>): string[] {
-  const selected: string[] = [];
+function selectValidationScripts(
+  packageScripts: Record<string, string>,
+): string[] {
+  const selected = new Set<string>();
 
-  if ("typecheck" in scripts) {
-    selected.push("typecheck");
+  if (packageScripts.typecheck) {
+    selected.add("typecheck");
   }
 
-  if ("lint" in scripts) {
-    selected.push("lint");
+  if (packageScripts.lint) {
+    selected.add("lint");
   }
 
   /*
-   * Prefer the targeted integration suite.
-   * If there isn't one, fall back to the
-   * repository's normal test script.
+   * During the MVP, correctness is more important
+   * than avoiding some duplicate test execution.
+   *
+   * Run every meaningful test surface the repository
+   * explicitly exposes.
    */
-  if ("test:integration" in scripts) {
-    selected.push("test:integration");
-  } else if ("test" in scripts) {
-    selected.push("test");
+  if (packageScripts["test:unit"]) {
+    selected.add("test:unit");
   }
 
-  return selected;
+  if (packageScripts["test:integration"]) {
+    selected.add("test:integration");
+  }
+
+  if (packageScripts.test) {
+    selected.add("test");
+  }
+
+  return [...selected];
 }
 
 function buildCommand(
-  packageManager: "npm" | "pnpm" | "yarn" | "bun",
+  packageManager: PackageManager,
   script: string,
 ): {
   command: string;
@@ -164,7 +176,7 @@ function buildCommand(
 
 async function runCheck(input: {
   workspaceRoot: string;
-  packageManager: "npm" | "pnpm" | "yarn" | "bun";
+  packageManager: PackageManager;
   script: string;
 }): Promise<ValidationCheck> {
   const command = buildCommand(input.packageManager, input.script);
@@ -201,8 +213,11 @@ async function runCheck(input: {
   } catch (error) {
     const executionError = error as {
       code?: number | string;
+
       stdout?: string;
+
       stderr?: string;
+
       message?: string;
     };
 
@@ -224,8 +239,174 @@ async function runCheck(input: {
   }
 }
 
+function normalizeRepositoryPath(filePath: string): string {
+  return filePath.trim().replaceAll("\\", "/");
+}
+
+function isTestPath(filePath: string): boolean {
+  const normalized = normalizeRepositoryPath(filePath);
+
+  return (
+    /(^|\/)(tests?|__tests__)(\/|$)/.test(normalized) ||
+    /\.(test|spec)\.[cm]?[jt]sx?$/.test(normalized)
+  );
+}
+
+function taskRequiresTestChanges(task: string): boolean {
+  return (
+    /\b(add|write|create|include|modify|update)\b.{0,30}\btests?\b/i.test(
+      task,
+    ) ||
+    /\bautomated tests?\b/i.test(task) ||
+    /\btest coverage\b/i.test(task)
+  );
+}
+
+async function getChangedFiles(workspaceRoot: string): Promise<string[]> {
+  /*
+   * `git diff HEAD` gives us tracked changes,
+   * including both staged and unstaged changes.
+   */
+  const trackedResult = await execFileAsync(
+    "git",
+    ["diff", "HEAD", "--name-only"],
+    {
+      cwd: workspaceRoot,
+
+      timeout: COMMAND_TIMEOUT_MS,
+
+      maxBuffer: 5 * 1024 * 1024,
+    },
+  );
+
+  /*
+   * `git diff` does not include genuinely new,
+   * untracked files, so collect those separately.
+   */
+  const untrackedResult = await execFileAsync(
+    "git",
+    ["ls-files", "--others", "--exclude-standard"],
+    {
+      cwd: workspaceRoot,
+
+      timeout: COMMAND_TIMEOUT_MS,
+
+      maxBuffer: 5 * 1024 * 1024,
+    },
+  );
+
+  const trackedFiles = trackedResult.stdout
+    .split("\n")
+    .map(normalizeRepositoryPath)
+    .filter(Boolean);
+
+  const untrackedFiles = untrackedResult.stdout
+    .split("\n")
+    .map(normalizeRepositoryPath)
+    .filter(Boolean);
+
+  return [...new Set([...trackedFiles, ...untrackedFiles])].filter(
+    (filePath) => filePath !== "node_modules" && filePath !== "node_modules/",
+  );
+}
+
+async function runRequiredTestChangeCheck(input: {
+  workspaceRoot: string;
+  task: string;
+}): Promise<ValidationCheck | undefined> {
+  /*
+   * This gate exists only when the user's task
+   * explicitly requires a test change.
+   *
+   * Normal tasks are unaffected.
+   *
+   * "BASELINE" is therefore also unaffected.
+   */
+  if (!taskRequiresTestChanges(input.task)) {
+    return undefined;
+  }
+
+  const startedAt = Date.now();
+
+  try {
+    const changedFiles = await getChangedFiles(input.workspaceRoot);
+
+    const changedTestFiles = changedFiles.filter(isTestPath);
+
+    const passed = changedTestFiles.length > 0;
+
+    return {
+      script: "task:test-change",
+
+      command:
+        "git diff HEAD --name-only && git ls-files --others --exclude-standard",
+
+      passed,
+
+      durationMs: Date.now() - startedAt,
+
+      stdout: truncate(
+        [
+          "Task explicitly requires automated tests.",
+          "",
+          "Changed repository files:",
+          changedFiles.length > 0
+            ? changedFiles.map((file) => `- ${file}`).join("\n")
+            : "(none)",
+          "",
+          "Changed test files:",
+          changedTestFiles.length > 0
+            ? changedTestFiles.map((file) => `- ${file}`).join("\n")
+            : "(none)",
+        ].join("\n"),
+      ),
+
+      stderr: passed
+        ? ""
+        : [
+            "The engineering task explicitly requires automated tests,",
+            "but ForgeLoop detected no modified or newly-created test files.",
+            "",
+            "The candidate does not satisfy the task requirements.",
+          ].join(" "),
+    };
+  } catch (error) {
+    const executionError = error as {
+      code?: number | string;
+
+      stdout?: string;
+
+      stderr?: string;
+
+      message?: string;
+    };
+
+    return {
+      script: "task:test-change",
+
+      command:
+        "git diff HEAD --name-only && git ls-files --others --exclude-standard",
+
+      passed: false,
+
+      exitCode: executionError.code,
+
+      durationMs: Date.now() - startedAt,
+
+      stdout: truncate(executionError.stdout ?? ""),
+
+      stderr: truncate(
+        executionError.stderr ??
+          executionError.message ??
+          "Unable to inspect repository changes.",
+      ),
+    };
+  }
+}
+
 export async function runValidation(
   workspaceRootInput: string,
+  task: string,
 ): Promise<ValidationResult> {
   const workspaceRoot = path.resolve(workspaceRootInput);
 
@@ -239,7 +420,7 @@ export async function runValidation(
     throw new Error(
       [
         "ForgeLoop could not find",
-        "typecheck, lint, test:integration",
+        "typecheck, lint, test:unit, test:integration",
         "or test scripts in package.json.",
       ].join(" "),
     );
@@ -250,10 +431,41 @@ export async function runValidation(
   const checks: ValidationCheck[] = [];
 
   /*
-   * Run sequentially.
+   * First enforce task requirements that can be
+   * proven mechanically.
+   *
+   * Example:
+   *
+   * "add automated tests"
+   *
+   * must result in at least one changed test file.
+   */
+  const requiredTestChangeCheck = await runRequiredTestChangeCheck({
+    workspaceRoot,
+    task,
+  });
+
+  if (requiredTestChangeCheck) {
+    console.log("Running validation: task:test-change...");
+
+    checks.push(requiredTestChangeCheck);
+
+    console.log(
+      requiredTestChangeCheck.passed
+        ? "PASS: task:test-change"
+        : "FAIL: task:test-change",
+    );
+  }
+
+  /*
+   * Run package checks sequentially.
    *
    * This keeps logs deterministic and avoids
-   * overloading a developer machine.
+   * unnecessarily overloading a developer machine.
+   *
+   * We deliberately continue even if the structural
+   * task gate failed so the validation report contains
+   * complete evidence about the candidate.
    */
   for (const script of validationScripts) {
     console.log(`Running validation: ${script}...`);

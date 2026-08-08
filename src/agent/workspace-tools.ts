@@ -22,6 +22,19 @@ const MAX_TOOL_RESULT_CHARACTERS = 24_000;
 const MAX_FILE_WRITES = 10;
 const MAX_COMMAND_RUNS = 8;
 
+/*
+ * Existing-file edits must remain local and reviewable.
+ *
+ * These limits prevent replace_in_file from behaving like
+ * an unrestricted whole-file rewrite while still allowing
+ * normal targeted implementation work.
+ */
+const MAX_REPLACE_FRAGMENT_CHARACTERS = 12_000;
+const MAX_REPLACE_SEARCH_LINES = 120;
+const MAX_REPLACE_TOTAL_MATCHED_LINES = 160;
+const MAX_REPLACE_LINE_GROWTH = 80;
+const MAX_REPLACE_CHARACTER_GROWTH = 12_000;
+
 const BLOCKED_PATH_SEGMENTS = new Set([
   ".git",
   "node_modules",
@@ -39,6 +52,12 @@ const BLOCKED_FILE_NAMES = new Set([
   ".env.development",
   ".env.development.local",
   ".env.production.local",
+]);
+
+const ALLOWED_ENV_TEMPLATE_FILE_NAMES = new Set([
+  ".env.example",
+  ".env.sample",
+  ".env.template",
 ]);
 
 const ALLOWED_SCRIPT_PATTERN =
@@ -61,16 +80,21 @@ const searchCodeSchema = z.object({
   limit: z.number().int().min(1).max(100).default(50),
 });
 
+/*
+ * write_file is intentionally CREATE-ONLY.
+ *
+ * Existing files must be changed through replace_in_file so the
+ * agent cannot accidentally overwrite a complete implementation.
+ */
 const writeFileSchema = z.object({
   path: z.string().min(1),
   content: z.string().max(MAX_WRITE_CHARACTERS),
-  mode: z.enum(["create", "overwrite"]),
 });
 
 const replaceInFileSchema = z.object({
   path: z.string().min(1),
-  search: z.string().min(1).max(40_000),
-  replacement: z.string().max(40_000),
+  search: z.string().min(1).max(MAX_REPLACE_FRAGMENT_CHARACTERS),
+  replacement: z.string().max(MAX_REPLACE_FRAGMENT_CHARACTERS),
   replaceAll: z.boolean().default(false),
 });
 
@@ -136,17 +160,14 @@ function containsBlockedSegment(relativePath: string): boolean {
     return false;
   }
 
+  if (ALLOWED_ENV_TEMPLATE_FILE_NAMES.has(filename)) {
+    return false;
+  }
+
   if (BLOCKED_FILE_NAMES.has(filename)) {
     return true;
   }
 
-  /*
-   * Also catch variants such as:
-   *
-   * .env.staging
-   * .env.test.local
-   * .env.whatever
-   */
   if (filename.startsWith(".env.")) {
     return true;
   }
@@ -287,6 +308,99 @@ async function detectPackageManager(
   return "npm";
 }
 
+function countLines(value: string): number {
+  if (value.length === 0) {
+    return 0;
+  }
+
+  return value.split("\n").length;
+}
+
+function assertBoundedReplacement(input: {
+  search: string;
+  replacement: string;
+  replaceAll: boolean;
+  occurrenceCount: number;
+}): {
+  replacements: number;
+  searchLines: number;
+  replacementLines: number;
+  totalMatchedLines: number;
+  totalLineGrowth: number;
+  totalCharacterGrowth: number;
+} {
+  const replacements = input.replaceAll ? input.occurrenceCount : 1;
+
+  const searchLines = countLines(input.search);
+
+  const replacementLines = countLines(input.replacement);
+
+  const totalMatchedLines = searchLines * replacements;
+
+  const totalLineGrowth = Math.max(
+    0,
+    (replacementLines - searchLines) * replacements,
+  );
+
+  const totalCharacterGrowth = Math.max(
+    0,
+    (input.replacement.length - input.search.length) * replacements,
+  );
+
+  if (searchLines > MAX_REPLACE_SEARCH_LINES) {
+    throw new Error(
+      [
+        "replace_in_file search fragment is too large.",
+        `Search lines: ${searchLines}.`,
+        `Maximum: ${MAX_REPLACE_SEARCH_LINES}.`,
+        "Use a smaller, more targeted exact fragment.",
+      ].join(" "),
+    );
+  }
+
+  if (totalMatchedLines > MAX_REPLACE_TOTAL_MATCHED_LINES) {
+    throw new Error(
+      [
+        "replace_in_file would touch too much existing code in one call.",
+        `Matched lines: ${totalMatchedLines}.`,
+        `Maximum: ${MAX_REPLACE_TOTAL_MATCHED_LINES}.`,
+        "Split the change into smaller targeted replacements.",
+      ].join(" "),
+    );
+  }
+
+  if (totalLineGrowth > MAX_REPLACE_LINE_GROWTH) {
+    throw new Error(
+      [
+        "replace_in_file would expand the file too much in one call.",
+        `Net added lines: ${totalLineGrowth}.`,
+        `Maximum: ${MAX_REPLACE_LINE_GROWTH}.`,
+        "Make a smaller localized replacement.",
+      ].join(" "),
+    );
+  }
+
+  if (totalCharacterGrowth > MAX_REPLACE_CHARACTER_GROWTH) {
+    throw new Error(
+      [
+        "replace_in_file would add too much content in one call.",
+        `Net added characters: ${totalCharacterGrowth}.`,
+        `Maximum: ${MAX_REPLACE_CHARACTER_GROWTH}.`,
+        "Make a smaller localized replacement.",
+      ].join(" "),
+    );
+  }
+
+  return {
+    replacements,
+    searchLines,
+    replacementLines,
+    totalMatchedLines,
+    totalLineGrowth,
+    totalCharacterGrowth,
+  };
+}
+
 function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
   const permittedScripts = Object.keys(packageScripts).filter((script) =>
     ALLOWED_SCRIPT_PATTERN.test(script),
@@ -297,15 +411,19 @@ function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
       type: "function",
       function: {
         name: "list_files",
+
         description:
           "List tracked and newly created files inside the isolated workspace.",
+
         parameters: {
           type: "object",
+
           properties: {
             path: {
               type: "string",
               description: "Repository-relative directory, normally '.'.",
             },
+
             limit: {
               type: "number",
               description: "Maximum files to return, up to 300.",
@@ -314,24 +432,31 @@ function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "read_file",
+
         description:
           "Read a text file inside the isolated workspace with line numbers.",
+
         parameters: {
           type: "object",
+
           required: ["path"],
+
           properties: {
             path: {
               type: "string",
               description: "Repository-relative file path.",
             },
+
             startLine: {
               type: "number",
               description: "Optional one-based starting line.",
             },
+
             endLine: {
               type: "number",
               description: "Optional one-based ending line.",
@@ -340,24 +465,31 @@ function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "search_code",
+
         description:
           "Search tracked repository files for an exact text or code fragment.",
+
         parameters: {
           type: "object",
+
           required: ["query"],
+
           properties: {
             query: {
               type: "string",
               description: "Text or code fragment to find.",
             },
+
             path: {
               type: "string",
               description: "Optional repository-relative search path.",
             },
+
             limit: {
               type: "number",
               description: "Maximum matching lines.",
@@ -366,28 +498,40 @@ function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "replace_in_file",
-        description:
-          "Safely replace an exact text fragment in an existing file. Prefer this over rewriting an entire existing file.",
+
+        description: [
+          "Safely replace a small exact text fragment in an existing file.",
+          "This is the ONLY tool for modifying existing files.",
+          "Large whole-file or oversized replacements are rejected.",
+          "Prefer small, specific replacements and split larger changes into multiple targeted edits.",
+        ].join(" "),
+
         parameters: {
           type: "object",
+
           required: ["path", "search", "replacement"],
+
           properties: {
             path: {
               type: "string",
               description: "Repository-relative existing file path.",
             },
+
             search: {
               type: "string",
               description: "Exact existing text to replace.",
             },
+
             replacement: {
               type: "string",
               description: "Replacement text.",
             },
+
             replaceAll: {
               type: "boolean",
               description:
@@ -397,51 +541,67 @@ function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "write_file",
-        description:
-          "Create a new file or deliberately overwrite a complete file inside the isolated workspace.",
+
+        description: [
+          "Create a NEW file inside the isolated workspace.",
+          "This tool can never overwrite an existing file.",
+          "Use replace_in_file to modify existing files.",
+        ].join(" "),
+
         parameters: {
           type: "object",
-          required: ["path", "content", "mode"],
+
+          required: ["path", "content"],
+
           properties: {
             path: {
               type: "string",
-              description: "Repository-relative file path.",
+              description:
+                "Repository-relative path for a new file that does not already exist.",
             },
+
             content: {
               type: "string",
-              description: "Complete file content.",
-            },
-            mode: {
-              type: "string",
-              enum: ["create", "overwrite"],
+              description: "Complete content for the new file.",
             },
           },
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "run_package_script",
-        description:
-          "Run an existing non-interactive validation script from package.json. Package installation and arbitrary shell commands are unavailable.",
+
+        description: [
+          "Run an existing non-interactive validation script from package.json.",
+          "Package installation and arbitrary shell commands are unavailable.",
+        ].join(" "),
+
         parameters: {
           type: "object",
+
           required: ["script"],
+
           properties: {
             script: {
               type: "string",
+
               enum:
                 permittedScripts.length > 0
                   ? permittedScripts
                   : ["NO_ALLOWED_SCRIPTS"],
             },
+
             args: {
               type: "array",
+
               items: {
                 type: "string",
               },
@@ -450,24 +610,30 @@ function createToolDefinitions(packageScripts: Record<string, string>): Tool[] {
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "git_status",
+
         description:
           "Show changed and untracked files in the isolated workspace.",
+
         parameters: {
           type: "object",
           properties: {},
         },
       },
     },
+
     {
       type: "function",
       function: {
         name: "git_diff",
+
         description:
           "Show tracked Git changes plus the contents of newly created untracked files in the isolated workspace.",
+
         parameters: {
           type: "object",
           properties: {},
@@ -534,7 +700,9 @@ export async function createWorkspaceToolRuntime(
           result = JSON.stringify(
             {
               path: input.path,
+
               count: files.length,
+
               files,
             },
             null,
@@ -618,6 +786,7 @@ export async function createWorkspaceToolRuntime(
           } catch (error) {
             const possibleError = error as {
               code?: number | string;
+
               stdout?: string;
             };
 
@@ -637,8 +806,11 @@ export async function createWorkspaceToolRuntime(
           result = JSON.stringify(
             {
               query: input.query,
+
               path: input.path,
+
               count: matches.length,
+
               matches,
             },
             null,
@@ -679,9 +851,26 @@ export async function createWorkspaceToolRuntime(
             );
           }
 
+          const replacementBounds = assertBoundedReplacement({
+            search: input.search,
+            replacement: input.replacement,
+            replaceAll: input.replaceAll,
+            occurrenceCount,
+          });
+
           const updated = input.replaceAll
             ? original.split(input.search).join(input.replacement)
             : original.replace(input.search, input.replacement);
+
+          if (updated === original) {
+            throw new Error(
+              [
+                "replace_in_file produced no repository change.",
+                "The search and replacement result are identical.",
+                "Do not use a no-op edit to satisfy an implementation requirement.",
+              ].join(" "),
+            );
+          }
 
           if (updated.length > MAX_WRITE_CHARACTERS) {
             throw new Error("Updated file exceeds the permitted size.");
@@ -694,7 +883,19 @@ export async function createWorkspaceToolRuntime(
           result = JSON.stringify(
             {
               path: input.path,
-              replacements: input.replaceAll ? occurrenceCount : 1,
+
+              replacements: replacementBounds.replacements,
+
+              searchLines: replacementBounds.searchLines,
+
+              replacementLines: replacementBounds.replacementLines,
+
+              totalMatchedLines: replacementBounds.totalMatchedLines,
+
+              totalLineGrowth: replacementBounds.totalLineGrowth,
+
+              totalCharacterGrowth: replacementBounds.totalCharacterGrowth,
+
               bytesWritten: Buffer.byteLength(updated),
             },
             null,
@@ -718,28 +919,64 @@ export async function createWorkspaceToolRuntime(
 
           await assertNoSymlinkSegments(workspaceRoot, absolutePath);
 
-          const exists = await pathExists(absolutePath);
-
-          if (input.mode === "create" && exists) {
-            throw new Error("Cannot create a file that already exists.");
-          }
-
-          if (input.mode === "overwrite" && !exists) {
-            throw new Error("Cannot overwrite a file that does not exist.");
+          /*
+           * write_file is CREATE-ONLY.
+           *
+           * Existing files MUST be modified with
+           * replace_in_file.
+           */
+          if (await pathExists(absolutePath)) {
+            throw new Error(
+              [
+                "write_file cannot modify an existing file.",
+                `File already exists: ${input.path}`,
+                "Use replace_in_file instead.",
+              ].join(" "),
+            );
           }
 
           await mkdir(path.dirname(absolutePath), {
             recursive: true,
           });
 
-          await writeFile(absolutePath, input.content, "utf8");
+          /*
+           * flag=wx gives us an atomic create-only
+           * guarantee as well, avoiding an accidental
+           * overwrite even if the file appears between
+           * the existence check and this write.
+           */
+          try {
+            await writeFile(absolutePath, input.content, {
+              encoding: "utf8",
+
+              flag: "wx",
+            });
+          } catch (error) {
+            const possibleError = error as {
+              code?: string;
+            };
+
+            if (possibleError.code === "EEXIST") {
+              throw new Error(
+                [
+                  "write_file cannot modify an existing file.",
+                  `File already exists: ${input.path}`,
+                  "Use replace_in_file instead.",
+                ].join(" "),
+              );
+            }
+
+            throw error;
+          }
 
           fileWrites += 1;
 
           result = JSON.stringify(
             {
               path: input.path,
-              mode: input.mode,
+
+              mode: "create",
+
               bytesWritten: Buffer.byteLength(input.content),
             },
             null,
@@ -769,29 +1006,38 @@ export async function createWorkspaceToolRuntime(
           commandRuns += 1;
 
           let command: string;
+
           let commandArguments: string[];
 
           switch (packageManager) {
             case "pnpm":
               command = "pnpm";
+
               commandArguments = ["run", input.script, ...input.args];
+
               break;
 
             case "yarn":
               command = "yarn";
+
               commandArguments = [input.script, ...input.args];
+
               break;
 
             case "bun":
               command = "bun";
+
               commandArguments = ["run", input.script, ...input.args];
+
               break;
 
             default:
               command = "npm";
+
               commandArguments = [
                 "run",
                 input.script,
+
                 ...(input.args.length > 0 ? ["--", ...input.args] : []),
               ];
           }
@@ -799,8 +1045,11 @@ export async function createWorkspaceToolRuntime(
           try {
             const execution = await execFileAsync(command, commandArguments, {
               cwd: workspaceRoot,
+
               timeout: 180_000,
+
               maxBuffer: 20 * 1024 * 1024,
+
               env: {
                 ...process.env,
                 CI: "1",
@@ -811,8 +1060,11 @@ export async function createWorkspaceToolRuntime(
               JSON.stringify(
                 {
                   success: true,
+
                   command: [command, ...commandArguments].join(" "),
+
                   stdout: execution.stdout,
+
                   stderr: execution.stderr,
                 },
                 null,
@@ -824,7 +1076,9 @@ export async function createWorkspaceToolRuntime(
               message?: string;
               stdout?: string;
               stderr?: string;
+
               code?: number | string;
+
               signal?: string;
             };
 
@@ -832,11 +1086,17 @@ export async function createWorkspaceToolRuntime(
               JSON.stringify(
                 {
                   success: false,
+
                   command: [command, ...commandArguments].join(" "),
+
                   exitCode: executionError.code,
+
                   signal: executionError.signal,
+
                   stdout: executionError.stdout ?? "",
+
                   stderr: executionError.stderr ?? "",
+
                   message: executionError.message,
                 },
                 null,
@@ -858,15 +1118,15 @@ export async function createWorkspaceToolRuntime(
 
         case "git_diff": {
           /*
-           * Regular `git diff` does not include newly created
-           * untracked files.
+           * Regular `git diff` does not include newly
+           * created untracked files.
            *
            * ForgeLoop therefore collects:
            *
            * 1. tracked-file diff statistics;
            * 2. tracked-file patch;
            * 3. untracked file paths;
-           * 4. bounded contents of those untracked files.
+           * 4. bounded contents of those files.
            */
 
           const [statistics, diff, untrackedOutput] = await Promise.all([
@@ -948,9 +1208,13 @@ export async function createWorkspaceToolRuntime(
 
       logs.push({
         timestamp: new Date().toISOString(),
+
         tool: toolName,
+
         arguments: rawArguments,
+
         success: true,
+
         result: truncate(result, 4_000),
       });
 
@@ -961,6 +1225,7 @@ export async function createWorkspaceToolRuntime(
       const result = JSON.stringify(
         {
           success: false,
+
           error: message,
         },
         null,
@@ -969,9 +1234,13 @@ export async function createWorkspaceToolRuntime(
 
       logs.push({
         timestamp: new Date().toISOString(),
+
         tool: toolName,
+
         arguments: rawArguments,
+
         success: false,
+
         result,
       });
 
